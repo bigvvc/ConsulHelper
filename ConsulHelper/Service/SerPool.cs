@@ -40,6 +40,10 @@ namespace BitAuto.Ucar.Utils.Common.Service
         /// </summary>
         protected bool disposed;
 
+        /// <summary>
+        /// 随机数生成器
+        /// </summary>
+        protected Random rand = new Random();
         #endregion
 
         #region 属性
@@ -136,47 +140,66 @@ namespace BitAuto.Ucar.Utils.Common.Service
         /// <returns>连接</returns>
         public virtual ISerClient BorrowClient()
         {
-            lock (locker)
+            if (Monitor.TryEnter(locker, TimeSpan.FromMilliseconds(ClientTimeout)))
             {
-                ISerClient client = null;
-                //连接池无空闲连接	
-
-                if (idleCount == 0)
+                try
                 {
-                    //连接池已已创建连接数达上限				
-                    if (activeCount >= MaxActive)
+                    ISerClient client = null;
+                    Exception innerErr = null;
+                    var validClient = false;
+                    //连接池无空闲连接	
+
+                    if (idleCount > 0 && !validClient)
                     {
-                        if (!resetEvent.WaitOne(ClientTimeout))
+                        client = DequeueClient();
+                        validClient = ValidateClient(client, out innerErr);
+                        if (!validClient)
                         {
-                            throw new TimeoutException("连接池繁忙，暂无可用连接。");
+                            DestoryClient(client);
                         }
                     }
-                    else
+
+                    //连接池无空闲连接	
+                    if (!validClient)
                     {
-                        var candiate = InitializeClient();
+                        //连接池已已创建连接数达上限				
+                        if (activeCount > MaxActive)
+                        {
+                            if (!resetEvent.WaitOne(ClientTimeout))
+                            {
+                                throw new TimeoutException("连接池繁忙，暂无可用连接。");
+                            }
+                        }
+                        else
+                        {
+                            client = InitializeClient(out innerErr);
+                            if (client == null)
+                            {
+                                throw new InvalidOperationException("连接获取失败，请确认调用服务状态。", innerErr);
+                            }
+                        }
+                    }
+
+                    //空闲连接数小于最小空闲数，添加一个连接到连接池（已创建数不能超标）			
+                    if (idleCount < MinIdle && activeCount < MaxActive)
+                    {
+                        var candiate = InitializeClient(out innerErr);
                         if (candiate != null)
                         {
                             EnqueueClient(candiate);
                         }
-                        else
-                        {
-                            throw new InvalidOperationException("连接获取失败，请确认调用服务状态。");
-                        }
                     }
-                }
-                client = DequeueClient();
 
-                //空闲连接数小于最小空闲数，添加一个连接到连接池（已创建数不能超标）			
-                if (idleCount < MinIdle && activeCount < MaxActive)
+                    return client;
+                }
+                finally
                 {
-                    var candiate = InitializeClient();
-                    if (candiate != null)
-                    {
-                        EnqueueClient(candiate);
-                    }
+                    Monitor.Exit(locker);
                 }
-
-                return client;
+            }
+            else
+            {
+                throw new TimeoutException("获取连接等待超过" + ClientTimeout + "毫秒。");
             }
         }
 
@@ -196,17 +219,19 @@ namespace BitAuto.Ucar.Utils.Common.Service
                 }
                 else
                 {
-                    if (ValidateClient(client))
-                    {
-                        //有效连接回归连接池
-                        client.Reset();
-                        EnqueueClient(client);
-                    }
-                    else
-                    {
-                        //无效连接回收
-                        DestoryClient(client);
-                    }
+                    //if (ValidateClient(client))
+                    //{
+                    //    //有效连接回归连接池
+                    //    client.Reset();
+                    //    EnqueueClient(client);
+                    //}
+                    //else
+                    //{
+                    //    //无效连接回收
+                    //    DestoryClient(client);
+                    //}
+                    //连接回归连接池
+                    EnqueueClient(client);
                     //发通知信号，连接池有连接变动
                     resetEvent.Set();
                 }
@@ -338,24 +363,37 @@ namespace BitAuto.Ucar.Utils.Common.Service
         /// 初始化连接，隐藏创建细节
         /// </summary>
         /// <returns>连接</returns>
-        protected ISerClient InitializeClient()
+        protected ISerClient InitializeClient(out Exception err)
         {
-            for (var i = 0; i< Hosts.Length;i++)
+            err = null;
+            if (Hosts.Length == 0)
+            {
+                err = new NullReferenceException("没有可用服务节点");
+                return null;
+            }
+            var hostIndexs = new int[Hosts.Length];
+            int j = 0;
+            for (var i = 0; i < Hosts.Length; i++)
+            {
+                hostIndexs[i] = i;
+            }
+            for (var i = 0; i < Hosts.Length; i++)
             {
                 try
                 {
-                    var threadId = Thread.CurrentThread.ManagedThreadId;
-                    var hostIndex = (threadId + i) % Hosts.Length;
-                    ISerClient client = CreateClient(Hosts[hostIndex]);
-                    if (ValidateClient(client))
+                    j = rand.Next(Hosts.Length);
+                    ISerClient client = CreateClient(Hosts[hostIndexs[j]]);
+                    if (ValidateClient(client, out err))
                     {
                         activeCount++;
                         client.Reset();
                         return client;
                     }
                 }
-                catch
+                catch (Exception e)
                 {
+                    hostIndexs[j] = hostIndexs[(j + 1) % Hosts.Length];
+                    err = e;
                     continue;
                 }
             }
@@ -367,15 +405,17 @@ namespace BitAuto.Ucar.Utils.Common.Service
         /// </summary>
         /// <param name="client">连接</param>
 
-        protected bool ValidateClient(ISerClient client)
+        protected bool ValidateClient(ISerClient client, out Exception err)
         {
             try
             {
                 client.Open();
+                err = null;
                 return true;
             }
-            catch
+            catch (Exception e)
             {
+                err = e;
                 return false;
             }
         }
